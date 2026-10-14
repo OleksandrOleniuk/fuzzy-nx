@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+FNX_VERSION="0.1.0"
+
+_usage() {
+  cat <<'USAGE'
+fnx — interactive Nx target runner powered by fzf
+
+Usage:
+  fnx [project] [target] [-- extra nx args...]
+  fnx [project] [target] [extra nx args...]
+
+Examples:
+  fnx
+  fnx my-app
+  fnx my-app test
+  fnx my-app test --watch
+  fnx my-app build --configuration=production
+  fnx my-app build -- --configuration=production
+
+Options:
+  -h, --help       Show this help
+  -v, --version    Show version
+  -n, --dry-run    Print the command instead of running it
+  -p, --print      Alias for --dry-run
+
+Shell support:
+  Launch fnx from Bash or Zsh; Bash is required to execute the script.
+
+Dependencies:
+  fzf, jq, and an Nx CLI available either:
+    1. from the workspace's node_modules/.bin/nx, or
+    2. globally on PATH
+USAGE
+}
+
+_die() {
+  printf 'fnx: %s\n' "$*" >&2
+  exit 1
+}
+
+_require() {
+  command -v "$1" >/dev/null 2>&1 ||
+    _die "required dependency '$1' was not found on PATH. Install $1 with your system package manager and ensure it is on PATH."
+}
+
+_find_workspace_root() {
+  local dir="$PWD"
+  while [ "$dir" != "/" ]; do
+    if [ -f "$dir/nx.json" ]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+
+  if [ -f "/nx.json" ]; then
+    printf '/\n'
+    return 0
+  fi
+
+  return 1
+}
+
+_nx() {
+  local root local_nx
+
+  root="${FNX_WORKSPACE_ROOT:-}"
+  if [ -z "$root" ]; then
+    root="$(_find_workspace_root)" || _die "could not find an Nx workspace (nx.json) from '$PWD'"
+    FNX_WORKSPACE_ROOT="$root"
+  fi
+
+  local_nx="$root/node_modules/.bin/nx"
+
+  # Prefer the workspace-local Nx so the CLI version matches the repo.
+  if [ -x "$local_nx" ]; then
+    "$local_nx" "$@"
+  elif command -v nx >/dev/null 2>&1; then
+    nx "$@"
+  else
+    _die "Nx CLI not found. Install workspace dependencies or install Nx globally."
+  fi
+}
+
+_print_command() {
+  local arg
+  printf 'nx'
+  for arg in "$@"; do
+    printf ' %q' "$arg"
+  done
+  printf '\n'
+}
+
+main() {
+  local explicit_configuration=0
+  local dry_run=0 project="" target="" configuration="" project_json=""
+  local arg
+  local -a positional=() extra_args=() configurations=()
+
+  # Parse fnx's own options only until the first positional argument.
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        _usage
+        return 0
+        ;;
+      -v|--version)
+        printf 'fnx %s\n' "$FNX_VERSION"
+        return 0
+        ;;
+      -n|--dry-run|-p|--print)
+        dry_run=1
+        shift
+        ;;
+      --)
+        shift
+        extra_args+=("$@")
+        break
+        ;;
+      *)
+        positional+=("$1")
+        shift
+        # Remaining arguments after project + target are forwarded to Nx.
+        if [ "${#positional[@]}" -ge 2 ]; then
+          if [ "${1:-}" = "--" ]; then
+            shift
+          fi
+          extra_args+=("$@")
+          break
+        fi
+        ;;
+    esac
+  done
+
+  _require fzf
+  _require jq
+
+  project="${positional[0]:-}"
+  target="${positional[1]:-}"
+
+  if [ -z "$project" ]; then
+    project="$(_nx show projects | fzf --prompt='project > ' --height=80% --reverse)" || return 130
+    [ -n "$project" ] || return 130
+  fi
+
+  # Fetch once and reuse for target/config discovery.
+  if ! project_json="$(_nx show project "$project" --json)"; then
+    _die "could not load Nx project '$project'"
+  fi
+
+  # Make project metadata available to fzf preview commands.
+  export FNX_PROJECT_JSON="$project_json"
+
+  if [ -z "$target" ]; then
+    target="$(
+      printf '%s\n' "$project_json" |
+        jq -r '.targets | keys[]' |
+        fzf \
+          --prompt='target > ' \
+          --height=80% \
+          --reverse \
+          --preview-window='right:60%:wrap' \
+          --preview "printf '%s\\n' \"\$FNX_PROJECT_JSON\" | jq --arg target {} '.targets[\$target]'"
+    )" || return 130
+    [ -n "$target" ] || return 130
+  fi
+
+  # Options after an Nx separator belong to the executor, not Nx.
+  for arg in "${extra_args[@]}"; do
+    case "$arg" in
+      --) break ;;
+      --configuration|--configuration=*|-c|-c=*)
+        explicit_configuration=1
+        break
+        ;;
+    esac
+  done
+
+  if [ "$explicit_configuration" -eq 0 ]; then
+    while IFS= read -r configuration; do
+      [ -n "$configuration" ] && configurations+=("$configuration")
+    done < <(
+      printf '%s\n' "$project_json" |
+        jq -r --arg target "$target" '.targets[$target].configurations // {} | keys[]'
+    )
+
+    case "${#configurations[@]}" in
+      0)
+        configuration=""
+        ;;
+      1)
+        # Exactly one named configuration: use it without another prompt.
+        configuration="${configurations[0]}"
+        ;;
+      *)
+        configuration="$(
+          printf '%s\n' "${configurations[@]}" |
+            fzf --prompt='configuration > ' --height=80% --reverse
+        )" || return 130
+        [ -n "$configuration" ] || return 130
+        ;;
+    esac
+  fi
+
+  local target_spec="$project:$target"
+  if [ -n "$configuration" ]; then
+    target_spec="$target_spec:$configuration"
+  fi
+
+  if [ "$dry_run" -eq 1 ]; then
+    _print_command run "$target_spec" "${extra_args[@]}"
+    return 0
+  fi
+
+  _nx run "$target_spec" "${extra_args[@]}"
+}
+
+main "$@"
